@@ -586,18 +586,28 @@ def get_user_selections():
         )
         anthropic_effort = ask_anthropic_effort()
 
+    # Step 8: Output language
+    console.print(
+        create_question_box(
+            "Step 8: Report Language",
+            "Select the language for analysis reports"
+        )
+    )
+    output_language = select_output_language()
+
     return {
         "ticker": selected_ticker,
         "analysis_date": analysis_date,
         "analysts": selected_analysts,
         "research_depth": selected_research_depth,
-        "llm_provider": selected_llm_provider.lower(),
+        "llm_provider": "openai" if selected_llm_provider.lower() in ("deepseek", "custom (openai-compatible)") else selected_llm_provider.lower(),
         "backend_url": backend_url,
         "shallow_thinker": selected_shallow_thinker,
         "deep_thinker": selected_deep_thinker,
         "google_thinking_level": thinking_level,
         "openai_reasoning_effort": reasoning_effort,
         "anthropic_effort": anthropic_effort,
+        "output_language": output_language,
     }
 
 
@@ -931,6 +941,7 @@ def run_analysis():
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
     config["anthropic_effort"] = selections.get("anthropic_effort")
+    config["output_language"] = selections.get("output_language")
 
     # Create stats callback handler for tracking LLM/tool calls
     stats_handler = StatsCallbackHandler()

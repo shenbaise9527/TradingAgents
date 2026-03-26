@@ -1,3 +1,5 @@
+import os
+
 import questionary
 from typing import List, Optional, Tuple, Dict
 
@@ -171,13 +173,28 @@ def select_shallow_thinking_agent(provider) -> str:
             ("GPT-OSS:latest (20B, local)", "gpt-oss:latest"),
             ("GLM-4.7-Flash:latest (30B, local)", "glm-4.7-flash:latest"),
         ],
+        "deepseek": [
+            ("DeepSeek Chat (V3) - Fast, cost-effective", "deepseek-chat"),
+            ("DeepSeek Reasoner (R1) - Deep reasoning", "deepseek-reasoner"),
+        ],
     }
+
+    provider_key = provider.lower()
+    if provider_key == "custom (openai-compatible)":
+        model = questionary.text(
+            "Enter quick-thinking model name:",
+            default="deepseek-chat",
+        ).ask()
+        if not model:
+            console.print("\n[red]No model selected. Exiting...[/red]")
+            exit(1)
+        return model
 
     choice = questionary.select(
         "Select Your [Quick-Thinking LLM Engine]:",
         choices=[
             questionary.Choice(display, value=value)
-            for display, value in SHALLOW_AGENT_OPTIONS[provider.lower()]
+            for display, value in SHALLOW_AGENT_OPTIONS[provider_key]
         ],
         instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
         style=questionary.Style(
@@ -238,13 +255,28 @@ def select_deep_thinking_agent(provider) -> str:
             ("GPT-OSS:latest (20B, local)", "gpt-oss:latest"),
             ("Qwen3:latest (8B, local)", "qwen3:latest"),
         ],
+        "deepseek": [
+            ("DeepSeek Reasoner (R1) - Deep reasoning", "deepseek-reasoner"),
+            ("DeepSeek Chat (V3) - Fast, cost-effective", "deepseek-chat"),
+        ],
     }
+
+    provider_key = provider.lower()
+    if provider_key == "custom (openai-compatible)":
+        model = questionary.text(
+            "Enter deep-thinking model name:",
+            default="deepseek-reasoner",
+        ).ask()
+        if not model:
+            console.print("\n[red]No model selected. Exiting...[/red]")
+            exit(1)
+        return model
 
     choice = questionary.select(
         "Select Your [Deep-Thinking LLM Engine]:",
         choices=[
             questionary.Choice(display, value=value)
-            for display, value in DEEP_AGENT_OPTIONS[provider.lower()]
+            for display, value in DEEP_AGENT_OPTIONS[provider_key]
         ],
         instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
         style=questionary.Style(
@@ -267,11 +299,13 @@ def select_llm_provider() -> tuple[str, str]:
     # Define OpenAI api options with their corresponding endpoints
     BASE_URLS = [
         ("OpenAI", "https://api.openai.com/v1"),
+        ("DeepSeek", "https://api.deepseek.com/v1"),
         ("Google", "https://generativelanguage.googleapis.com/v1"),
         ("Anthropic", "https://api.anthropic.com/"),
         ("xAI", "https://api.x.ai/v1"),
         ("Openrouter", "https://openrouter.ai/api/v1"),
         ("Ollama", "http://localhost:11434/v1"),
+        ("Custom (OpenAI-compatible)", "custom"),
     ]
     
     choice = questionary.select(
@@ -295,6 +329,17 @@ def select_llm_provider() -> tuple[str, str]:
         exit(1)
     
     display_name, url = choice
+
+    if url == "custom":
+        env_base = os.environ.get("OPENAI_API_BASE", "")
+        url = questionary.text(
+            "Enter OpenAI-compatible API base URL:",
+            default=env_base,
+        ).ask()
+        if not url:
+            console.print("\n[red]No URL provided. Exiting...[/red]")
+            exit(1)
+
     print(f"You selected: {display_name}\tURL: {url}")
 
     return display_name, url
@@ -356,3 +401,29 @@ def ask_gemini_thinking_config() -> str | None:
             ("pointer", "fg:green noinherit"),
         ]),
     ).ask()
+
+
+def select_output_language() -> str | None:
+    """Select the output language for reports. Returns None for English (default)."""
+    choice = questionary.select(
+        "Select Report Language:",
+        choices=[
+            questionary.Choice("English (default)", None),
+            questionary.Choice("Chinese / 中文", "Chinese"),
+            questionary.Choice("Japanese / 日本語", "Japanese"),
+            questionary.Choice("Korean / 한국어", "Korean"),
+            questionary.Choice("Other (type your own)", "other"),
+        ],
+        style=questionary.Style([
+            ("selected", "fg:cyan noinherit"),
+            ("highlighted", "fg:cyan noinherit"),
+            ("pointer", "fg:cyan noinherit"),
+        ]),
+    ).ask()
+
+    if choice == "other":
+        choice = questionary.text("Enter language name (e.g. Spanish, French):").ask()
+        if not choice:
+            return None
+
+    return choice

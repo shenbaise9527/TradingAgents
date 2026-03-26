@@ -20,6 +20,18 @@ from tradingagents.agents.utils.news_data_tools import (
 )
 
 
+def get_language_instruction() -> str:
+    """Return a language instruction string based on config, or empty if default English."""
+    from tradingagents.dataflows.config import get_config
+    lang = get_config().get("output_language")
+    if not lang:
+        return ""
+    return (
+        f"IMPORTANT: You MUST write your entire response in {lang}. "
+        f"All analysis, reports, tables, and recommendations must be in {lang}. "
+    )
+
+
 def build_instrument_context(ticker: str) -> str:
     """Describe the exact instrument so agents preserve exchange-qualified tickers."""
     return (
