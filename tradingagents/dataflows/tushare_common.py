@@ -1,11 +1,47 @@
-import os
 import logging
+import os
+from datetime import datetime, timedelta, timezone
 
-from .errors import VendorNotConfiguredError, VendorRateLimitError
+from .errors import (
+    NoMarketDataError,
+    VendorNotConfiguredError,
+    VendorRateLimitError,
+)
 
 logger = logging.getLogger(__name__)
 
 _pro_api = None
+
+# China A-share exchanges run on Asia/Shanghai time. Prefer the system tzdata
+# via zoneinfo; fall back to a fixed UTC+8 offset so module import can never
+# fail on a host without tzdata (this module is imported by every dataflow
+# entry point through interface.py).
+try:
+    from zoneinfo import ZoneInfo
+
+    _CN_TZ = ZoneInfo("Asia/Shanghai")
+except Exception:  # noqa: BLE001 — missing/unknown tzdata must not break import
+    _CN_TZ = timezone(timedelta(hours=8))
+
+# tushare error-message keyword tables, so the routing layer reacts by the
+# *behaviour* of the failure rather than the raw text. tushare's messages are
+# Chinese; English equivalents are kept for safety. Entitlement (permission /
+# points) failures mean the account cannot access this interface at all — the
+# router treats that as "vendor not configured for this method" and falls
+# back. Genuine throttling maps to the rate-limit type (auto-retry semantics).
+_TUSHARE_RATE_LIMIT_MARKERS = (
+    "每分钟", "频率", "限流", "访问限制",
+    "rate limit", "too frequent", "api rate",
+)
+_TUSHARE_ENTITLEMENT_MARKERS = (
+    "权限", "积分", "没有访问该接口",
+    "permission", "not entitled", "no access",
+)
+
+
+def shanghai_now() -> datetime:
+    """Return the current time in the China A-share trading timezone (UTC+8)."""
+    return datetime.now(_CN_TZ)
 
 
 class TushareRateLimitError(VendorRateLimitError):
@@ -27,12 +63,17 @@ class TushareNotConfiguredError(VendorNotConfiguredError):
 
 
 def get_api_token() -> str:
-    """Retrieve the Tushare API token from environment variables."""
-    token = os.getenv("TUSHARE_API_TOKEN")
+    """Retrieve the Tushare API token from environment variables.
+
+    ``TUSHARE_API_TOKEN`` is the primary variable; ``TUSHARE_TOKEN`` is accepted
+    as an alias (common in shell setups). Raises ``TushareNotConfiguredError``
+    (a ``ValueError``) when neither is set.
+    """
+    token = os.getenv("TUSHARE_API_TOKEN") or os.getenv("TUSHARE_TOKEN")
     if not token:
         raise TushareNotConfiguredError(
-            "TUSHARE_API_TOKEN environment variable is not set. "
-            "Get your token at https://tushare.pro/register"
+            "TUSHARE_API_TOKEN (or its TUSHARE_TOKEN alias) environment "
+            "variable is not set. Get your token at https://tushare.pro/register"
         )
     return token
 
@@ -41,7 +82,13 @@ def get_pro_api():
     """Get a cached Tushare pro_api instance (lazy singleton)."""
     global _pro_api
     if _pro_api is None:
-        import tushare as ts
+        try:
+            import tushare as ts
+        except ImportError as exc:  # pragma: no cover — env-dependent
+            raise TushareNotConfiguredError(
+                "the 'tushare' package is not installed; install it with "
+                "'pip install \".[tushare]\"'"
+            ) from exc
         _pro_api = ts.pro_api(get_api_token())
     return _pro_api
 
@@ -57,37 +104,56 @@ def from_tushare_date(date_str: str) -> str:
 
 
 def normalize_ts_code(symbol: str) -> str:
-    """Normalize a ticker symbol to Tushare ts_code format (e.g., '000001.SZ').
+    """Normalize a ticker symbol to Tushare ts_code format (e.g., '600000.SH').
 
-    Rules:
-        - Already has .SH/.SZ/.BJ suffix -> return uppercased as-is
-        - 6-digit code starting with 6 -> append .SH (Shanghai)
-        - 6-digit code starting with 0 or 3 -> append .SZ (Shenzhen)
-        - 6-digit code starting with 8 or 4 -> append .BJ (Beijing/BSE)
-        - Otherwise -> return as-is with warning
+    Accepts a bare 6-digit code or any CN-suffixed form — ``.SH`` (tushare),
+    ``.SS`` (Yahoo Shanghai), ``.SZ`` (both), ``.BJ`` (Beijing) — and derives
+    the exchange from the leading digit:
+        - 6xxxxx -> .SH (Shanghai)
+        - 0/3xxxxx -> .SZ (Shenzhen)
+        - 8/4xxxxx -> .BJ (Beijing/BSE)
+
+    Raises ``NoMarketDataError`` for symbols that are not China A-share
+    equities (US/HK/crypto/index codes), so the vendor router falls back to
+    the next vendor without spending an API call.
     """
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise NoMarketDataError(symbol, None, "empty symbol")
     symbol = symbol.strip().upper()
 
-    # Already has exchange suffix
-    if symbol.endswith((".SH", ".SZ", ".BJ")):
-        return symbol
-
-    # Strip any other suffix (e.g., .SS used by Yahoo for Shanghai)
-    bare = symbol.split(".")[0] if "." in symbol else symbol
+    # Strip any recognized CN suffix (.SH/.SS/.SZ/.BJ), then re-derive the
+    # exchange from the leading digit so the code wins over a wrong suffix.
+    bare = symbol
+    for suffix in (".SH", ".SS", ".SZ", ".BJ"):
+        if symbol.endswith(suffix):
+            bare = symbol[: -len(suffix)]
+            break
 
     if len(bare) == 6 and bare.isdigit():
         first = bare[0]
         if first == "6":
             return f"{bare}.SH"
-        elif first in ("0", "3"):
+        if first in ("0", "3"):
             return f"{bare}.SZ"
-        elif first in ("8", "4"):
+        if first in ("8", "4"):
             return f"{bare}.BJ"
 
-    logger.warning(
-        f"Cannot determine exchange for symbol '{symbol}', returning as-is"
+    raise NoMarketDataError(
+        symbol,
+        symbol,
+        "not a China A-share equity (expected a 6-digit code: 6xxxxx=SH, "
+        "0/3xxxxx=SZ, 8/4xxxxx=BJ)",
     )
-    return symbol
+
+
+def _classify_tushare_error(message: str):
+    """Return the typed error class for a tushare error message, or None."""
+    lowered = message.lower()
+    if any(kw in lowered for kw in _TUSHARE_ENTITLEMENT_MARKERS):
+        return TushareNotConfiguredError
+    if any(kw in lowered for kw in _TUSHARE_RATE_LIMIT_MARKERS):
+        return TushareRateLimitError
+    return None
 
 
 def tushare_api_call(api_method, **kwargs):
@@ -102,12 +168,16 @@ def tushare_api_call(api_method, **kwargs):
 
     Raises:
         TushareRateLimitError: When the API reports a rate or credit limit.
+        TushareNotConfiguredError: When the account lacks permission/points for
+            the interface (``权限``/``积分``) or the package is not installed.
     """
     try:
         result = api_method(**kwargs)
         return result
-    except Exception as e:
-        msg = str(e).lower()
-        if any(kw in msg for kw in ("限制", "limit", "频率", "credits", "积分", "权限")):
+    except Exception as e:  # noqa: BLE001 — must classify vendor error text
+        error_cls = _classify_tushare_error(str(e))
+        if error_cls is TushareNotConfiguredError:
+            raise TushareNotConfiguredError(f"Tushare access denied: {e}") from e
+        if error_cls is TushareRateLimitError:
             raise TushareRateLimitError(f"Tushare rate/credit limit: {e}") from e
         raise

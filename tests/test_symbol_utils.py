@@ -54,6 +54,45 @@ class TestNormalizeSymbol(unittest.TestCase):
 
 
 @pytest.mark.unit
+class TestCNEquityNormalization(unittest.TestCase):
+    """A-share (China) symbols normalize to Yahoo's .SS/.SZ/.BJ forms.
+
+    Yahoo uses ``.SS`` for Shanghai while tushare uses ``.SH``; the canonical
+    (Yahoo) form is produced here so every yfinance-touching path — price
+    tools, verified-market snapshot, identity lookup, benchmark map — sees the
+    same symbol the default vendor actually fetches (#A-share bridge).
+    """
+
+    def test_bare_shanghai_code(self):
+        self.assertEqual(normalize_symbol("600000"), "600000.SS")
+
+    def test_sh_suffix_bridged_to_ss(self):
+        # tushare-style .SH input is bridged to Yahoo's .SS.
+        self.assertEqual(normalize_symbol("600000.SH"), "600000.SS")
+
+    def test_ss_suffix_idempotent(self):
+        self.assertEqual(normalize_symbol("600000.SS"), "600000.SS")
+
+    def test_shenzhen_codes(self):
+        self.assertEqual(normalize_symbol("000001"), "000001.SZ")
+        self.assertEqual(normalize_symbol("300001"), "300001.SZ")
+        self.assertEqual(normalize_symbol("000001.SZ"), "000001.SZ")
+
+    def test_beijing_bse_codes(self):
+        self.assertEqual(normalize_symbol("830001"), "830001.BJ")
+        self.assertEqual(normalize_symbol("430001"), "430001.BJ")
+
+    def test_lowercase_and_space_trimmed(self):
+        self.assertEqual(normalize_symbol("  600000.sh  "), "600000.SS")
+        self.assertEqual(normalize_symbol("000001.sz"), "000001.SZ")
+
+    def test_non_cn_equities_untouched(self):
+        # Hong Kong / US / index / non-CN-suffixed inputs must not be mangled.
+        for sym in ("0700.HK", "AAPL", "^GSPC", "GC=F", "123456", "60000", "6000000"):
+            self.assertEqual(normalize_symbol(sym), sym)
+
+
+@pytest.mark.unit
 class TestNoMarketDataError(unittest.TestCase):
     def test_message_includes_resolution(self):
         err = NoMarketDataError("XAUUSD+", "GC=F", "no rows")

@@ -72,6 +72,34 @@ _ALIASES = {
 # Yahoo symbols may contain letters, digits, and these structural characters.
 _YAHOO_SAFE = re.compile(r"^[A-Za-z0-9._\-\^=]+$")
 
+# China A-share equities: Yahoo lists Shanghai as ``.SS`` (tushare uses ``.SH``),
+# Shenzhen as ``.SZ`` (same in both), and Beijing (BSE) as ``.BJ``. The exchange
+# is derivable from the leading digit of the 6-digit code, purely syntactically:
+#   6xxxxx -> Shanghai, 0/3xxxxx -> Shenzhen, 8/4xxxxx -> Beijing.
+_CN_SUFFIX_BY_DIGIT = {"6": ".SS", "0": ".SZ", "3": ".SZ", "8": ".BJ", "4": ".BJ"}
+_CN_INPUT_SUFFIXES = (".SS", ".SH", ".SZ", ".BJ")
+
+
+def _normalize_cn_equity(s: str) -> str | None:
+    """Return the canonical Yahoo form (e.g. ``600000.SS``) for A-share input.
+
+    Accepts a bare 6-digit code (``600000``), the tushare-style ``.SH`` suffix
+    (bridged to Yahoo's ``.SS``), or an already-Yahoo ``.SS/.SZ/.BJ`` form.
+    Returns None for anything that is not a China A-share equity, so ordinary
+    US/HK/index/crypto symbols pass through untouched.
+    """
+    for suffix in _CN_INPUT_SUFFIXES:
+        if s.endswith(suffix):
+            bare = s[: -len(suffix)]
+            if len(bare) == 6 and bare.isdigit():
+                yahoo_suffix = _CN_SUFFIX_BY_DIGIT.get(bare[0])
+                return bare + yahoo_suffix if yahoo_suffix else None
+            return None
+    if len(s) == 6 and s.isdigit():
+        yahoo_suffix = _CN_SUFFIX_BY_DIGIT.get(s[0])
+        return s + yahoo_suffix if yahoo_suffix else None
+    return None
+
 
 # Crypto quote currencies that all map to Yahoo's USD pair. Yahoo lists only
 # ``<BASE>-USD`` (not the USDT/USDC stablecoin pairs), so a broker symbol quoted
@@ -131,7 +159,7 @@ def normalize_symbol(raw: str) -> str:
     elif len(s) == 6 and s[:3] in _FOREX_CURRENCIES and s[3:] in _FOREX_CURRENCIES:
         canonical = f"{s}=X"
     else:
-        canonical = s
+        canonical = _normalize_cn_equity(s) or s
 
     if canonical != raw.strip().upper():
         logger.info("Resolved symbol %r to Yahoo symbol %r", raw, canonical)
