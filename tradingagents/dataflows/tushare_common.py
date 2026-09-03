@@ -46,6 +46,25 @@ def shanghai_now() -> datetime:
     return datetime.now(_CN_TZ)
 
 
+def cst_to_utc(dt_str) -> datetime | None:
+    """Parse a China-standard-time string to an aware UTC datetime.
+
+    Accepts ``YYYY-MM-DD HH:MM:SS`` (tushare news) or a bare ``YYYY-MM-DD``
+    date. Returns None for empty/unparsable input so callers can treat the
+    item as undated (``date_window.in_window`` then keeps it only for live
+    runs — never a backtest).
+    """
+    if not dt_str:
+        return None
+    text = str(dt_str).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:19], fmt).replace(tzinfo=_CN_TZ).astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
 class TushareRateLimitError(VendorRateLimitError):
     """Raised when the Tushare API rate/credit limit is exceeded.
 
