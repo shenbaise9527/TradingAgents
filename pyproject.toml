@@ -29,7 +29,6 @@ dependencies = [
     "setuptools>=80.9.0",
     "stockstats>=0.6.5",
     "tqdm>=4.67.1",
-    "tushare>=1.4.2",
     "typing-extensions>=4.14.0",
     "yfinance>=1.4.1",
 ]
@@ -44,6 +43,14 @@ dev = [
 # stays lean: pip install "tradingagents[bedrock]".
 bedrock = [
     "langchain-aws>=1.5.0",
+]
+
+# Tushare support for China A-share market data. Optional so the core install
+# stays lean and import-safe without it: pip install "tradingagents[tushare]".
+# Lazy-imported; a missing package/token surfaces as a typed "not configured"
+# error that the vendor router handles like any other unavailable vendor.
+tushare = [
+    "tushare>=1.4.2",
 ]
 
 [project.scripts]
