@@ -1,62 +1,54 @@
-from typing import Annotated
 from datetime import datetime
+from typing import Annotated
 
+from .errors import NoMarketDataError
+from .stockstats_utils import _assert_ohlcv_not_stale
 from .tushare_common import (
-    get_pro_api,
+    daily_to_ohlcv_frame,
+    fetch_daily_bars,
     normalize_ts_code,
-    to_tushare_date,
-    from_tushare_date,
-    tushare_api_call,
 )
 
 
 def get_stock(
-    symbol: Annotated[str, "ticker symbol of the company (e.g., 000001.SZ)"],
+    symbol: Annotated[str, "ticker symbol of the company (e.g. 600000.SS, 000001.SZ)"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ) -> str:
-    """Fetch daily OHLCV data from Tushare for A-shares."""
+    """Fetch daily OHLCV data from Tushare for China A-shares.
+
+    Returns a ``# header + CSV`` string shaped exactly like the yfinance
+    vendor's ``get_stock_data`` output, so the LLM sees one format regardless
+    of the configured vendor. Prices are 前复权 (qfq) so they line up with the
+    yfinance ``auto_adjust`` figures used by the verified-market snapshot.
+
+    Raises:
+        NoMarketDataError: non-A-share symbol, empty range, stale frame, or an
+            unexpected response shape — the router emits one NO_DATA sentinel
+            (and falls back to a next vendor when configured).
+    """
+    datetime.strptime(start_date, "%Y-%m-%d")
+    datetime.strptime(end_date, "%Y-%m-%d")
+
+    # Typed rejection of non-CN symbols before any API spend.
     ts_code = normalize_ts_code(symbol)
-    ts_start = to_tushare_date(start_date)
-    ts_end = to_tushare_date(end_date)
+    raw = fetch_daily_bars(ts_code, start_date, end_date, adj="qfq")
 
-    pro = get_pro_api()
-    df = tushare_api_call(
-        pro.daily, ts_code=ts_code, start_date=ts_start, end_date=ts_end
-    )
-
-    if df is None or df.empty:
-        return (
-            f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
+    if raw is None or raw.empty:
+        raise NoMarketDataError(
+            symbol, ts_code, f"no rows between {start_date} and {end_date}"
         )
+    result = daily_to_ohlcv_frame(raw, symbol=symbol, ts_code=ts_code)
 
-    # Sort by trade_date ascending (Tushare returns newest first)
-    df = df.sort_values("trade_date").reset_index(drop=True)
+    # Reject a frame whose latest bar is far older than the requested end date
+    # (delisted, long-suspended, or a bad partial response) — same guard the
+    # yfinance path applies (#1021 semantics).
+    _assert_ohlcv_not_stale(result, end_date, symbol, ts_code)
 
-    # Map columns to the framework's expected format
-    result = df[["trade_date", "open", "high", "low", "close", "vol"]].copy()
-    result.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
-
-    # Tushare vol is in "hands" (手 = 100 shares), convert to shares
-    result["Volume"] = (result["Volume"] * 100).astype(int)
-
-    # A-shares don't have a separate adjusted close; use close
-    result["Adj Close"] = result["Close"]
-
-    # Round prices to 2 decimal places
-    for col in ["Open", "High", "Low", "Close", "Adj Close"]:
-        result[col] = result[col].round(2)
-
-    # Convert dates from YYYYMMDD to yyyy-mm-dd
-    result["Date"] = result["Date"].apply(from_tushare_date)
-
-    # Reorder columns to match yfinance output
-    result = result[["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]]
-
-    csv_string = result.to_csv(index=False)
-
-    header = f"# Stock data for {ts_code} from {start_date} to {end_date}\n"
+    requested = symbol.strip().upper()
+    label = ts_code if ts_code == requested else f"{ts_code} (from {symbol})"
+    header = f"# Stock data for {label} from {start_date} to {end_date}\n"
     header += f"# Total records: {len(result)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
-    return header + csv_string
+    return header + result.to_csv(index=False)

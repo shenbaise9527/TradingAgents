@@ -1,5 +1,5 @@
-from typing import Annotated
 from datetime import datetime
+from typing import Annotated
 
 from .tushare_common import (
     get_pro_api,
@@ -11,10 +11,7 @@ from .tushare_common import (
 
 def _latest_quarter_end(ref_date: str | None = None) -> str:
     """Return the most recent quarter-end date as YYYYMMDD relative to ref_date."""
-    if ref_date:
-        dt = datetime.strptime(ref_date, "%Y-%m-%d")
-    else:
-        dt = datetime.now()
+    dt = datetime.strptime(ref_date, "%Y-%m-%d") if ref_date else datetime.now()
     month = dt.month
     year = dt.year
     if month >= 10:
@@ -30,10 +27,7 @@ def _latest_quarter_end(ref_date: str | None = None) -> str:
 def _quarter_periods(ref_date: str | None, count: int = 8) -> list[str]:
     """Generate a list of recent quarter-end period strings (YYYYMMDD)."""
     quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
-    if ref_date:
-        dt = datetime.strptime(ref_date, "%Y-%m-%d")
-    else:
-        dt = datetime.now()
+    dt = datetime.strptime(ref_date, "%Y-%m-%d") if ref_date else datetime.now()
 
     periods = []
     year = dt.year
@@ -274,7 +268,7 @@ def get_income_statement(
         return f"Error retrieving income statement for {ticker}: {str(e)}"
 
 
-def _dedupe_concat(frames: list) -> "pd.DataFrame":
+def _dedupe_concat(frames: list):
     """Concatenate DataFrames and drop duplicate reporting periods."""
     import pandas as pd
 

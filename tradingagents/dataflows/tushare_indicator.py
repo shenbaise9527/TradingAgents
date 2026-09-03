@@ -1,199 +1,148 @@
 import os
-from typing import Annotated
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
+from typing import Annotated
 
 import pandas as pd
+from dateutil.relativedelta import relativedelta
+from stockstats import wrap
 
-from .tushare_common import (
-    get_pro_api,
-    normalize_ts_code,
-    to_tushare_date,
-    from_tushare_date,
-    tushare_api_call,
+from .config import get_config
+from .errors import NoMarketDataError
+from .stockstats_utils import (
+    INDICATOR_DESCRIPTIONS,
+    _assert_ohlcv_not_stale,
+    _clean_dataframe,
+    _fill_price_gaps,
+    _needs_same_day_refresh,
 )
-from .stockstats_utils import _clean_dataframe
+from .tushare_common import (
+    daily_to_ohlcv_frame,
+    fetch_daily_bars,
+    normalize_ts_code,
+    shanghai_now,
+)
+from .utils import safe_ticker_component
+
+# History window mirrors the yfinance ``load_ohlcv`` path: 5 years ending
+# today (Shanghai time) so long-window indicators (200 SMA) have warm-up data.
+_HISTORY_YEARS = 5
 
 
-# Same indicator descriptions used by y_finance.py — keep in sync
-_INDICATOR_DESCRIPTIONS = {
-    "close_50_sma": (
-        "50 SMA: A medium-term trend indicator. "
-        "Usage: Identify trend direction and serve as dynamic support/resistance. "
-        "Tips: It lags price; combine with faster indicators for timely signals."
-    ),
-    "close_200_sma": (
-        "200 SMA: A long-term trend benchmark. "
-        "Usage: Confirm overall market trend and identify golden/death cross setups. "
-        "Tips: It reacts slowly; best for strategic trend confirmation rather than frequent trading entries."
-    ),
-    "close_10_ema": (
-        "10 EMA: A responsive short-term average. "
-        "Usage: Capture quick shifts in momentum and potential entry points. "
-        "Tips: Prone to noise in choppy markets; use alongside longer averages for filtering false signals."
-    ),
-    "macd": (
-        "MACD: Computes momentum via differences of EMAs. "
-        "Usage: Look for crossovers and divergence as signals of trend changes. "
-        "Tips: Confirm with other indicators in low-volatility or sideways markets."
-    ),
-    "macds": (
-        "MACD Signal: An EMA smoothing of the MACD line. "
-        "Usage: Use crossovers with the MACD line to trigger trades. "
-        "Tips: Should be part of a broader strategy to avoid false positives."
-    ),
-    "macdh": (
-        "MACD Histogram: Shows the gap between the MACD line and its signal. "
-        "Usage: Visualize momentum strength and spot divergence early. "
-        "Tips: Can be volatile; complement with additional filters in fast-moving markets."
-    ),
-    "rsi": (
-        "RSI: Measures momentum to flag overbought/oversold conditions. "
-        "Usage: Apply 70/30 thresholds and watch for divergence to signal reversals. "
-        "Tips: In strong trends, RSI may remain extreme; always cross-check with trend analysis."
-    ),
-    "boll": (
-        "Bollinger Middle: A 20 SMA serving as the basis for Bollinger Bands. "
-        "Usage: Acts as a dynamic benchmark for price movement. "
-        "Tips: Combine with the upper and lower bands to effectively spot breakouts or reversals."
-    ),
-    "boll_ub": (
-        "Bollinger Upper Band: Typically 2 standard deviations above the middle line. "
-        "Usage: Signals potential overbought conditions and breakout zones. "
-        "Tips: Confirm signals with other tools; prices may ride the band in strong trends."
-    ),
-    "boll_lb": (
-        "Bollinger Lower Band: Typically 2 standard deviations below the middle line. "
-        "Usage: Indicates potential oversold conditions. "
-        "Tips: Use additional analysis to avoid false reversal signals."
-    ),
-    "atr": (
-        "ATR: Averages true range to measure volatility. "
-        "Usage: Set stop-loss levels and adjust position sizes based on current market volatility. "
-        "Tips: It's a reactive measure, so use it as part of a broader risk management strategy."
-    ),
-    "vwma": (
-        "VWMA: A moving average weighted by volume. "
-        "Usage: Confirm trends by integrating price action with volume data. "
-        "Tips: Watch for skewed results from volume spikes; use in combination with other volume analyses."
-    ),
-    "mfi": (
-        "MFI: The Money Flow Index is a momentum indicator that uses both price and volume to measure buying and selling pressure. "
-        "Usage: Identify overbought (>80) or oversold (<20) conditions and confirm the strength of trends or reversals. "
-        "Tips: Use alongside RSI or MACD to confirm signals; divergence between price and MFI can indicate potential reversals."
-    ),
-}
+def _fetch_history(
+    symbol: str, ts_code: str, curr_date: str
+) -> pd.DataFrame:
+    """Fetch 5y of qfq daily bars with disk cache, trimmed to the analysis date.
 
-
-def _fetch_and_cache_daily(ts_code: str, cache_dir: str) -> pd.DataFrame:
-    """Fetch 15 years of daily data from Tushare, with CSV caching."""
-    today = pd.Timestamp.today()
-    start_date = today - pd.DateOffset(years=15)
-    start_str = start_date.strftime("%Y%m%d")
-    end_str = today.strftime("%Y%m%d")
-
+    Mirrors the guarantee pipeline of ``stockstats_utils.load_ohlcv`` — the
+    same cache directory, the same-day refresh TTL, look-ahead trimming to
+    ``curr_date``, and the stale-frame rejection — so indicator values have
+    point-in-time semantics identical to the yfinance path. A cached file is
+    never served empty; empty/column-less caches are refetched.
+    """
+    config = get_config()
+    cache_dir = config["data_cache_dir"]
     os.makedirs(cache_dir, exist_ok=True)
-    cache_file = os.path.join(
-        cache_dir,
-        f"{ts_code}-Tushare-data-{start_date.strftime('%Y-%m-%d')}-{today.strftime('%Y-%m-%d')}.csv",
+
+    today_dt = pd.Timestamp(shanghai_now().date())
+    curr_dt = pd.to_datetime(curr_date, errors="coerce").normalize()
+    if pd.isna(curr_dt):
+        raise NoMarketDataError(symbol, ts_code, f"invalid analysis date {curr_date!r}")
+
+    start_dt = today_dt - pd.DateOffset(years=_HISTORY_YEARS)
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = today_dt.strftime("%Y-%m-%d")
+    safe = safe_ticker_component(ts_code)
+    data_file = os.path.join(
+        cache_dir, f"{safe}-Tushare-daily-{start_str}-{end_str}.csv"
     )
 
-    if os.path.exists(cache_file):
-        return pd.read_csv(cache_file, on_bad_lines="skip")
+    data = None
+    if os.path.exists(data_file):
+        cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
+        # Serve the cache only when usable and not a stale snapshot of the day
+        # being requested; otherwise refetch (same rules as load_ohlcv, #1150).
+        if (
+            not cached.empty
+            and "Close" in cached.columns
+            and not _needs_same_day_refresh(data_file, curr_dt, today_dt)
+        ):
+            data = cached
 
-    pro = get_pro_api()
+    if data is None:
+        downloaded = fetch_daily_bars(ts_code, start_str, end_str, adj="qfq")
+        frame = daily_to_ohlcv_frame(downloaded, symbol=symbol, ts_code=ts_code)
+        if frame.empty:
+            raise NoMarketDataError(
+                symbol, ts_code, "tushare returned no daily rows for the history window"
+            )
+        frame.to_csv(data_file, index=False, encoding="utf-8")
+        data = frame
 
-    # Tushare limits single query to ~5000 rows; fetch in yearly chunks
-    frames = []
-    cursor = pd.to_datetime(end_str)
-    chunk_start = pd.to_datetime(start_str)
-    while cursor > chunk_start:
-        seg_start = max(cursor - pd.DateOffset(years=2), chunk_start)
-        df_chunk = tushare_api_call(
-            pro.daily,
-            ts_code=ts_code,
-            start_date=seg_start.strftime("%Y%m%d"),
-            end_date=cursor.strftime("%Y%m%d"),
+    data = _clean_dataframe(data)
+    # Point-in-time: drop any row after the analysis date before computing
+    # indicators, so a backtest never sees the future (#1021 semantics).
+    data = data[data["Date"] <= curr_dt]
+    if data.empty:
+        raise NoMarketDataError(
+            symbol, ts_code, f"no rows on or before {curr_date}"
         )
-        if df_chunk is not None and not df_chunk.empty:
-            frames.append(df_chunk)
-        cursor = seg_start - pd.DateOffset(days=1)
-
-    if not frames:
-        return pd.DataFrame()
-
-    data = pd.concat(frames, ignore_index=True)
-    data = data.drop_duplicates(subset=["trade_date"]).sort_values("trade_date")
-
-    # Rename to framework-standard columns and convert units
-    result = data[["trade_date", "open", "high", "low", "close", "vol"]].copy()
-    result.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    result["Volume"] = (result["Volume"] * 100).astype(int)
-    result["Date"] = result["Date"].apply(from_tushare_date)
-
-    result.to_csv(cache_file, index=False)
-    return result
+    data = _fill_price_gaps(data)
+    _assert_ohlcv_not_stale(data, curr_date, symbol, ts_code)
+    return data
 
 
 def get_indicator(
     symbol: Annotated[str, "ticker symbol of the company"],
     indicator: Annotated[str, "technical indicator to get the analysis and report of"],
-    curr_date: Annotated[str, "The current trading date you are trading on, YYYY-mm-dd"],
+    curr_date: Annotated[
+        str, "The current trading date you are trading on, YYYY-mm-dd"
+    ],
     look_back_days: Annotated[int, "how many days to look back"],
-    interval: str = "daily",
-    time_period: int = 14,
-    series_type: str = "close",
 ) -> str:
-    """Compute technical indicators for A-shares using Tushare data + stockstats."""
-    from stockstats import wrap
-    from .config import get_config
+    """Compute technical indicators for A-shares using Tushare + stockstats.
 
-    indicator = indicator.lower()
-    if indicator not in _INDICATOR_DESCRIPTIONS:
+    Output shape and wording mirror ``get_stock_stats_indicators_window`` (the
+    yfinance path) and the indicator descriptions come from the same shared
+    ``INDICATOR_DESCRIPTIONS`` source, so agent-facing behaviour does not vary
+    with the configured vendor.
+    """
+    datetime.strptime(curr_date, "%Y-%m-%d")
+    ts_code = normalize_ts_code(symbol)
+
+    indicator = (indicator or "").strip().lower()
+    if indicator not in INDICATOR_DESCRIPTIONS:
         raise ValueError(
             f"Indicator {indicator} is not supported. "
-            f"Please choose from: {list(_INDICATOR_DESCRIPTIONS.keys())}"
+            f"Please choose from: {list(INDICATOR_DESCRIPTIONS.keys())}"
         )
 
-    ts_code = normalize_ts_code(symbol)
-    config = get_config()
-    cache_dir = config.get("data_cache_dir", "data")
-
-    # Fetch (or load cached) long-history daily data
-    raw = _fetch_and_cache_daily(ts_code, cache_dir)
-    if raw.empty:
-        return f"No historical data available for {symbol} from Tushare."
-
-    data = _clean_dataframe(raw.copy())
+    data = _fetch_history(symbol, ts_code, curr_date)
     df = wrap(data)
     df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
 
-    # Trigger stockstats indicator calculation
-    df[indicator]
+    df[indicator]  # Trigger stockstats to calculate the indicator.
 
-    # Build date-value lookup
     indicator_map = {}
     for _, row in df.iterrows():
-        val = row[indicator]
-        indicator_map[row["Date"]] = "N/A" if pd.isna(val) else str(val)
+        value = row[indicator]
+        indicator_map[row["Date"]] = "N/A" if pd.isna(value) else str(value)
 
-    # Generate output for the requested window
-    end_date = curr_date
-    curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
-    before = curr_dt - relativedelta(days=look_back_days)
+    end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    before = end_dt - relativedelta(days=look_back_days)
 
     lines = []
-    dt = curr_dt
-    while dt >= before:
-        ds = dt.strftime("%Y-%m-%d")
-        val = indicator_map.get(ds, "N/A: Not a trading day (weekend or holiday)")
-        lines.append(f"{ds}: {val}")
-        dt -= relativedelta(days=1)
+    current_dt = end_dt
+    while current_dt >= before:
+        date_str = current_dt.strftime("%Y-%m-%d")
+        lines.append(
+            f"{date_str}: {indicator_map.get(date_str, 'N/A: Not a trading day (weekend or holiday)')}"
+        )
+        current_dt -= relativedelta(days=1)
 
-    result_str = (
-        f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {end_date}:\n\n"
+    return (
+        f"## {indicator} values from {before.strftime('%Y-%m-%d')} to "
+        f"{end_dt.strftime('%Y-%m-%d')}:\n\n"
         + "\n".join(lines)
         + "\n\n"
-        + _INDICATOR_DESCRIPTIONS.get(indicator, "No description available.")
+        + INDICATOR_DESCRIPTIONS[indicator]
     )
-    return result_str

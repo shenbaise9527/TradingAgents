@@ -1,12 +1,12 @@
-from typing import Annotated
 from datetime import datetime
+from typing import Annotated
+
 from dateutil.relativedelta import relativedelta
 
 from .tushare_common import (
     get_pro_api,
     normalize_ts_code,
     to_tushare_date,
-    from_tushare_date,
     tushare_api_call,
 )
 
@@ -167,6 +167,6 @@ def get_insider_transactions(
 
     header = f"# Major Shareholder Trading data for {ts_code}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    header += f"# Note: This shows major shareholder increases/decreases in holdings\n\n"
+    header += "# Note: This shows major shareholder increases/decreases in holdings\n\n"
 
     return header + csv_string
